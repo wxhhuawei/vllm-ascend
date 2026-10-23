@@ -398,10 +398,12 @@ class NPUPlatform(Platform):
 
     @classmethod
     def _get_indexer_block_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        import os
+
         from math import lcm
 
         model_config = vllm_config.model_config
-        if not model_config.use_mla:
+        if not model_config.use_mla and os.environ.get("VLLM_QSA_SHORTSEQ_STD_KV", "0") != "1":
             for config_name in ("hf_text_config", "hf_config"):
                 config = getattr(model_config, config_name, None)
                 ratio = getattr(config, "indexer_compress_ratio", None)
