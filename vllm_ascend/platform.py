@@ -429,7 +429,11 @@ class NPUPlatform(Platform):
 
         model_config = vllm_config.model_config
         text_config = getattr(model_config, "hf_text_config", None)
-        if not model_config.use_mla and getattr(text_config, "indexer_compress_ratio", None) is not None:
+        if (
+            not model_config.use_mla
+            and getattr(text_config, "indexer_compress_ratio", None) is not None
+            and __import__("os").environ.get("VLLM_QSA_SHORTSEQ_STD_KV", "0") != "1"
+        ):
             from math import prod
 
             from vllm.model_executor.models import ModelRegistry
