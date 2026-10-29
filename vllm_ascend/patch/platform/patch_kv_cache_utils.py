@@ -896,6 +896,66 @@ def _merge_mamba_state_groups(
     return [replacements.get(index, group) for index, group in enumerate(groups) if index not in drop]
 
 
+def _merge_qsa_stub_main_groups(
+    groups: list[KVCacheGroupSpec],
+) -> list[KVCacheGroupSpec]:
+    """Merge per-layer QSA main FullAttentionSpec groups in dense-stub mode.
+
+    In short-sequence standard-paged-KV mode (VLLM_QSA_SHORTSEQ_STD_KV=1)
+    the QSA layers have no indexer side caches, so
+    _prepare_qsa_composite_groups finds no raw owners and the six-region
+    merge is skipped entirely. Upstream grouping then leaves every one of
+    the QSA layers as its own group (interleaved with GDN layers, so
+    consecutive-run merging never unifies them): each layer allocates a
+    private block pool and pays a per-group block-table maintenance cost on
+    every decode step. Bucket-merge them into one UniformTypeKVCacheSpecs
+    group so they share a single block table, exactly like
+    _merge_mamba_state_groups does for GDN state layers.
+    """
+    buckets: dict[tuple, list[int]] = {}
+    for index, group in enumerate(groups):
+        spec = group.kv_cache_spec
+        if isinstance(spec, FullAttentionSpec) and not isinstance(spec, UniformTypeKVCacheSpecs):
+            key = (
+                spec.page_size_bytes,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.head_size_v,
+                str(spec.dtype),
+                spec.kv_quant_mode,
+                group.is_eagle_group,
+            )
+            buckets.setdefault(key, []).append(index)
+    drop: set[int] = set()
+    replacements: dict[int, KVCacheGroupSpec] = {}
+    for indices in buckets.values():
+        if len(indices) < 2:
+            continue
+        names = [name for index in indices for name in groups[index].layer_names]
+        uniform = UniformTypeKVCacheSpecs.from_specs(
+            {name: groups[idx].kv_cache_spec for idx in indices for name in groups[idx].layer_names}
+        )
+        if uniform is None:
+            continue
+        first = indices[0]
+        replacements[first] = KVCacheGroupSpec(
+            names,
+            uniform,
+            is_eagle_group=groups[first].is_eagle_group,
+        )
+        drop.update(indices[1:])
+    if not replacements:
+        return groups
+    merged = [replacements.get(index, group) for index, group in enumerate(groups) if index not in drop]
+    logger.info(
+        "QSA dense-stub grouping: merged %d per-layer groups into %d group(s)",
+        sum(len(v) for v in buckets.values()),
+        len(merged),
+    )
+    return merged
+
+
 def _get_ascend_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -905,6 +965,9 @@ def _get_ascend_kv_cache_groups(
     qsa_owners = _prepare_qsa_composite_groups(kv_cache_spec)
     groups = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
     if qsa_owners is None:
+        import os as _os
+        if _os.environ.get("VLLM_QSA_SHORTSEQ_STD_KV", "0") == "1":
+            return _merge_mamba_state_groups(_merge_qsa_stub_main_groups(groups))
         return groups
     merged = _merge_qsa_composite_groups(
         groups,
@@ -1022,7 +1085,7 @@ def _align_qsa_gbsa_block_stride(
         logger.warning_once(
             "QSA GBSA page alignment skipped because the shared KV pool has "
             "multiple block strides: %s",
-            sorted(block_strides),
+            tuple(sorted(block_strides)),
         )
         return kv_cache_config
 

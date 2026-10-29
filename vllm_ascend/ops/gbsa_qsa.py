@@ -179,7 +179,10 @@ def qsa_gbsa_attention(
     sparse_idx = compact_indices[:, :sparse_width].to(torch.int32)
     full_blocks = torch.div(row_seq_lens, GBSA_COMPRESS_RATIO, rounding_mode="floor")
     valid = (sparse_idx >= 0) & (sparse_idx < full_blocks.unsqueeze(1))
-    order = torch.argsort((~valid).to(torch.int32), dim=1, stable=True)
+    # Integer argsort falls back to AiCPU on Ascend (~570us per call); the
+    # boolean mask is exactly representable in float32, which keeps this
+    # stable partition on AiCore without changing the resulting order.
+    order = torch.argsort((~valid).to(torch.float32), dim=1, stable=True)
     sparse_idx = sparse_idx.gather(1, order)
     sparse_count = valid.sum(dim=1).to(torch.int32)
     sparse_idx = sparse_idx.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
